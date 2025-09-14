@@ -16,7 +16,7 @@ git clone https://github.com/soybeanAdmin/zerossl-ipcert.git
 
 ## 3. 初始化
 
-### 3.1 放置脚本与配置
+### 3.1 放置脚本与配置（此项重要）
 
 ​**脚本**​（`/usr/local/bin/zerossl-ipcert/zerossl-ipcert.sh`）确保可执行：
 
@@ -94,7 +94,7 @@ POST_RELOAD_CMD="systemctl reload nginx"
 }
 ```
 
-## 5. 首次安装
+## 5. 首次申请证书
 
 ```
 sudo /usr/local/bin/zerossl-ipcert/zerossl-ipcert.sh run
@@ -142,3 +142,4 @@ systemctl status zerossl-ipcert.timer --no-pager
 systemctl list-timers | grep zerossl-ipcert
 
 ```
+
