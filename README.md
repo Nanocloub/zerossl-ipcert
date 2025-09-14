@@ -24,7 +24,7 @@ git clone https://github.com/soybeanAdmin/zerossl-ipcert.git
 sudo chmod +x /usr/local/bin/zerossl-ipcert/zerossl-ipcert.sh
 ```
 
-​**同目录 `.env` 示例**​（`/usr/local/bin/.env`）：
+​**同目录 `.env` 示例**​（`cp .env.example .env`）：
 
 ```.env
 # ZeroSSL 访问密钥（控制台 Developer 里拿）
@@ -64,21 +64,21 @@ POST_RELOAD_CMD="systemctl reload nginx"
 ```
 :443 {
     # HTTPS: 使用你已经下发的 IP 证书
-    tls /usr/share/caddy/zerossl/fullchain.pem /usr/share/caddy/zerossl/privkey.key
+    tls /usr/share/caddy/zerossl/fullchain.pem /usr/share/caddy/zerossl/private.key
 
     root * /usr/share/caddy
     file_server
     @api path /api/*
 
     handle @api {
-        reverse_proxy https://board.suyou.org {
+        reverse_proxy https://www.xxx.com {
             header_up Host {upstream_hostport}
             header_up X-Forwarded-Host {host}
             header_up X-Real-IP {remote_host}
             header_up X-Forwarded-For {remote_host}
             header_up X-Forwarded-Proto {scheme}
-            header_up Referer "https://board.suyou.org"
-            header_up Origin "https://board.suyou.org"
+            header_up Referer "https://www.xxx.com"
+            header_up Origin "https://www.xxx.com"
         }
     }
 }
@@ -142,5 +142,6 @@ systemctl status zerossl-ipcert.timer --no-pager
 systemctl list-timers | grep zerossl-ipcert
 
 ```
+
 
 
