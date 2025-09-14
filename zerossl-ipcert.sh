@@ -18,7 +18,7 @@ need curl; need jq; need openssl
 VALID_DIR="${WEBROOT%/}/.well-known/pki-validation"
 mkdir -p "$VALID_DIR" "$INSTALL_DIR"
 
-key="$INSTALL_DIR/privkey.key"
+key="$INSTALL_DIR/private.key"
 csr="$INSTALL_DIR/req.csr"
 crt="$INSTALL_DIR/cert.pem"
 cab="$INSTALL_DIR/ca_bundle.pem"
