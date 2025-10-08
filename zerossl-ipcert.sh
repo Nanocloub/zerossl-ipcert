@@ -22,7 +22,7 @@ key="$INSTALL_DIR/private.key"
 csr="$INSTALL_DIR/req.csr"
 crt="$INSTALL_DIR/cert.pem"
 cab="$INSTALL_DIR/ca_bundle.pem"
-full="$INSTALL_DIR/fullchain.pem"
+full="$INSTALL_DIR/certificate.crt"
 
 # ==========================
 #   Helpers
