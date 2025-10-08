@@ -37,20 +37,34 @@ days_left() {
 }
 
 gen_key_csr() {
+  version=$(lsb_release -r -s 2>/dev/null)
+  major_version=$(echo "$version" | cut -d. -f1)
+
   if [[ -f "$key" && -f "$csr" && "$ROTATE_KEY" -eq 0 ]]; then
     log "沿用现有私钥与 CSR：$key"
   else
     log "生成私钥与 CSR（SAN=IP:${IP}）"
-    openssl req -new -newkey rsa:2048 -nodes \
+    if [[ "$major_version" -gt 9 ]]; then
+      openssl req -new -newkey rsa:2048 -nodes \
       -keyout "$key" -out "$csr" \
       -subj "/CN=${IP}" \
       -addext "subjectAltName = IP:${IP}"
+    else
+      openssl req -new -newkey rsa:2048 -nodes \
+      -keyout "$key" -out "$csr" \
+      -subj "/CN=${IP}"
+    fi
+    
     chmod 600 "$key"
   fi
 
+  
   # 一致性检查
-  openssl req -in "$csr" -noout -text | grep -q "IP Address:${IP}" \
+  if [[ "$major_version" -gt 9 ]]; then
+   openssl req -in "$csr" -noout -text | grep -q "IP Address:${IP}" \
     || { log "CSR 中 SAN IP 与配置不一致"; exit 1; }
+  fi
+  
 }
 
 create_order() {
