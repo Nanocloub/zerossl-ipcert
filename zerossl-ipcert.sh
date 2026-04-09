@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # ==========================
 #   Load config & prereqs
@@ -14,6 +14,7 @@ source "$CONF"
 log()  { printf '[%(%F %T)T] %s\n' -1 "$*" | tee -a /var/log/zerossl-ipcert.log; }
 need() { command -v "$1" >/dev/null 2>&1 || { log "缺少依赖：$1"; exit 1; }; }
 need curl; need jq; need openssl
+trap 'rc=$?; log "脚本异常退出：line=${LINENO}, exit=${rc}"' ERR
 
 VALID_DIR="${WEBROOT%/}/.well-known/pki-validation"
 mkdir -p "$VALID_DIR" "$INSTALL_DIR"
@@ -76,6 +77,41 @@ create_order() {
     -d "strict_domains=true"
 }
 
+find_existing_draft() {
+  curl -sS "https://api.zerossl.com/certificates?access_key=${ZEROSSL_KEY}&limit=100" \
+    | jq -r --arg ip "$IP" '
+        .results[]
+        | select(.common_name==$ip and .status=="draft")
+        | .id
+      ' \
+    | head -n1
+}
+
+log_cert_debug() {
+  local tag="$1"
+  local json="$2"
+  local debug
+
+  debug=$(printf '%s' "$json" | jq -c --arg ip "$IP" '
+    {
+      id: (.id // empty),
+      status: (.status // empty),
+      common_name: (.common_name // empty),
+      validation: (
+        .validation.other_methods[$ip]
+        // .validation
+        // empty
+      ),
+      error: (.error // empty)
+    }
+  ' 2>/dev/null || true)
+
+  if [[ -n "$debug" ]]; then
+    log "${tag}：${debug}"
+  fi
+  return 0
+}
+
 write_validation() {
   local id="$1"
   local json http_url body file fname cleaned lines
@@ -83,26 +119,28 @@ write_validation() {
   # 1) 拉取详情
   json=$(curl -sS "https://api.zerossl.com/certificates/$id?access_key=${ZEROSSL_KEY}") \
     || { log "获取证书详情失败"; exit 1; }
+  log_cert_debug "证书详情" "$json"
 
   # 2) 解析 URL 与内容（内容可能是 array 或 string）
   http_url=$(printf '%s' "$json" | jq -r --arg ip "$IP" '
     .validation.other_methods[$ip].file_validation_url_http
     // .validation.file_validation_url_http
     // empty
-  ')
+  ' 2>/dev/null || true)
   body=$(printf '%s' "$json" | jq -r --arg ip "$IP" '
     .validation.other_methods[$ip].file_validation_content
     // .validation.file_validation_content
     // empty
     | (if type=="array" then join("\n") else . end)
-  ')
+  ' 2>/dev/null || true)
 
-  [[ -n "$http_url" && -n "$body" ]] || { log "未拿到校验信息"; echo "$json" | jq -C .; exit 1; }
+  [[ -n "$http_url" && -n "$body" ]] || { log "未拿到校验信息"; log "原始详情：$(printf '%s' "$json" | jq -c . 2>/dev/null || printf '%s' "$json")"; exit 1; }
 
   # 3) 规范化写入：去 BOM、去 \r，仅保留前三个非空行
   mkdir -p "$VALID_DIR"
   fname="$(basename "$http_url")"
   file="$VALID_DIR/$fname"
+  log "写入校验文件：$file（来源：$http_url）"
 
   cleaned=$(
     printf '%s' "$body" \
@@ -124,32 +162,89 @@ write_validation() {
   # 5) 本机连通性（公网放行 80 由你保证）
   curl -fsSI "http://${IP}/.well-known/pki-validation/$fname" >/dev/null \
     || { log "HTTP 校验 URL 访问失败：http://${IP}/.well-known/pki-validation/$fname"; exit 1; }
+  log "HTTP 校验 URL 可访问：http://${IP}/.well-known/pki-validation/$fname"
 }
 
 trigger_and_wait() {
   local id="$1"
-  local r status
+  local r status detail v_status v_error
+  local poll_max poll_sleep draft_stuck_rounds
 
-  log "触发校验"
+  poll_max="${POLL_MAX_ROUNDS:-60}"
+  poll_sleep="${POLL_INTERVAL_SECONDS:-11}"
+  draft_stuck_rounds="${DRAFT_STUCK_ROUNDS:-12}"
+
+  log "触发校验（HTTP_CSR_HASH）"
   r=$(curl -sS -X POST "https://api.zerossl.com/certificates/${id}/challenges?access_key=${ZEROSSL_KEY}" \
        -d validation_method=HTTP_CSR_HASH)
-  echo "$r" | jq -C . >/dev/null || true
-
-  if ! echo "$r" | grep -q '"success":true'; then
-    r=$(curl -sS -X POST "https://api.zerossl.com/certificates/${id}/challenges?access_key=${ZEROSSL_KEY}" \
-         -d validation_method=FILE_CSR_HASH)
-    echo "$r" | jq -C . >/dev/null || true
+  log "挑战返回（HTTP_CSR_HASH）：$(echo "$r" | jq -c '.')"
+  if echo "$r" | jq -e '.success == true or .status == "pending_validation" or .status == "issued"' >/dev/null 2>&1; then
+    log "HTTP_CSR_HASH 已接受，进入轮询"
+  else
+    log "HTTP_CSR_HASH 触发失败：$(echo "$r" | jq -c '.error // .')"
+    if [[ "${ENABLE_FILE_CSR_HASH_FALLBACK:-0}" == "1" ]]; then
+      log "触发校验（FILE_CSR_HASH）"
+      r=$(curl -sS -X POST "https://api.zerossl.com/certificates/${id}/challenges?access_key=${ZEROSSL_KEY}" \
+           -d validation_method=FILE_CSR_HASH)
+      log "挑战返回（FILE_CSR_HASH）：$(echo "$r" | jq -c '.')"
+      if ! echo "$r" | jq -e '.success == true or .status == "pending_validation" or .status == "issued"' >/dev/null 2>&1; then
+        log "FILE_CSR_HASH 触发失败：$(echo "$r" | jq -c '.error // .')"
+        log "挑战触发失败，停止轮询"
+        exit 1
+      fi
+    else
+      log "挑战触发失败，停止轮询"
+      exit 1
+    fi
   fi
 
-  for i in {1..60}; do
-    status=$(curl -sS "https://api.zerossl.com/certificates/$id?access_key=${ZEROSSL_KEY}" | jq -r '.status')
-    log "轮询 #$i -> $status"
+  for ((i=1; i<=poll_max; i++)); do
+    detail=$(curl -sS "https://api.zerossl.com/certificates/$id?access_key=${ZEROSSL_KEY}")
+    status=$(echo "$detail" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+    v_status=$(echo "$detail" | jq -r --arg ip "$IP" '
+      .validation.other_methods[$ip].status
+      // .validation.status
+      // empty
+    ' 2>/dev/null || true)
+    v_error=$(echo "$detail" | jq -r --arg ip "$IP" '
+      .validation.other_methods[$ip].error
+      // .validation.error
+      // .error
+      // empty
+      | if type=="object" then (.code|tostring) + ":" + (.type // .message // "unknown") else tostring end
+    ' 2>/dev/null || true)
+
+    if [[ -n "$v_status" ]]; then
+      log "轮询 #$i -> cert=${status}, validation=${v_status}"
+    else
+      log "轮询 #$i -> cert=${status}"
+    fi
+    if [[ "$status" == "unknown" ]]; then
+      log "轮询响应非 JSON：$detail"
+    fi
+
+    if (( i == 1 || i % 5 == 0 )); then
+      log_cert_debug "轮询详情 #$i" "$detail"
+    fi
+
     [[ "$status" = issued ]] && return 0
     [[ "$status" = cancelled || "$status" = revoked ]] && { log "状态异常：$status"; exit 1; }
-    sleep 11
+
+    if [[ "$v_status" = invalid || "$v_status" = failed ]]; then
+      log "校验失败：${v_error:-unknown}"
+      exit 1
+    fi
+
+    if [[ "$status" = draft && "$i" -ge "$draft_stuck_rounds" ]]; then
+      log "连续 ${i} 轮保持 draft，判定卡住，停止轮询"
+      [[ -n "$v_error" ]] && log "调试信息：$v_error"
+      exit 1
+    fi
+
+    sleep "$poll_sleep"
   done
 
-  log "等待超时"
+  log "等待超时（max=${poll_max}, interval=${poll_sleep}s）"
   exit 1
 }
 
@@ -195,7 +290,7 @@ cancel_old_drafts() {
 #   Main flow
 # ==========================
 issue_or_renew() {
-  local remain id create
+  local remain id create reuse_draft
 
   remain=$(days_left)
   if (( remain > RENEW_BEFORE_DAYS )); then
@@ -205,14 +300,23 @@ issue_or_renew() {
 
   gen_key_csr
 
-  # 先清旧草稿，避免占额度
-  cancel_old_drafts ""
+  reuse_draft="${REUSE_EXISTING_DRAFT:-1}"
+  if [[ "$reuse_draft" == "1" ]]; then
+    id="$(find_existing_draft || true)"
+    if [[ -n "${id:-}" ]]; then
+      log "复用已有 Draft：$id"
+    fi
+  fi
 
-  log "创建证书订单（${VALID_DAYS} 天）"
-  create=$(create_order "$VALID_DAYS")
-  id=$(echo "$create" | jq -r '.id // empty')
+  if [[ -z "${id:-}" ]]; then
+    # 无可复用草稿时，先清旧草稿再创建，避免占额度
+    cancel_old_drafts ""
+    log "创建证书订单（${VALID_DAYS} 天）"
+    create=$(create_order "$VALID_DAYS")
+    id=$(echo "$create" | jq -r '.id // empty')
+  fi
 
-  if [[ -z "$id" ]]; then
+  if [[ -z "${id:-}" ]]; then
     log "创建失败，返回：$(echo "$create" | jq -c .)"
     if [[ "$VALID_DAYS" != "90" ]]; then
       log "回退到 90 天再试"
@@ -223,6 +327,7 @@ issue_or_renew() {
 
   [[ -n "$id" ]] || { log "仍然失败，请检查配额/额度或取消占用的草稿"; exit 1; }
   log "证书ID：$id"
+  [[ -n "${create:-}" ]] && log_cert_debug "创建返回" "$create"
 
   # 保留当前订单再次清理其它 Draft
   cancel_old_drafts "$id"
